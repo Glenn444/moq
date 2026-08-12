@@ -17,7 +17,7 @@ const WIRE_VERSION: qmux::Version = qmux::Version::QMux01;
 
 /// Plaintext-TCP qmux listener settings (no TLS, no UDP).
 ///
-/// Flattened onto [`crate::ServerConfig::tcp`]. TCP carries no peer identity, so
+/// Flattened onto [`crate::listen::Config::tcp`]. TCP carries no peer identity, so
 /// the listener must only be reachable from trusted clients. Bind it to loopback
 /// or a private interface; a non-loopback bind logs a warning but is allowed.
 // The derived arg group is named after the struct, so it needs an explicit id to

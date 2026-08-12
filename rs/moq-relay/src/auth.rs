@@ -245,20 +245,20 @@ impl AuthTls {
 		!self.root.is_empty() || self.cert.is_some() || self.key.is_some() || self.disable_verify.is_some()
 	}
 
-	/// Convert into a [`moq_native::tls::Client`] so we can reuse its
+	/// Convert into a [`moq_native::tls::Connect`] so we can reuse its
 	/// rustls-building logic. The fields map one-to-one.
-	fn to_client_tls(&self) -> anyhow::Result<moq_native::tls::Client> {
+	fn to_client_tls(&self) -> anyhow::Result<moq_native::tls::Connect> {
 		match (&self.cert, &self.key) {
 			(Some(_), None) => anyhow::bail!("--auth-tls-cert requires --auth-tls-key"),
 			(None, Some(_)) => anyhow::bail!("--auth-tls-key requires --auth-tls-cert"),
 			_ => {}
 		}
 
-		let mut tls = moq_native::tls::Client::default();
+		let mut tls = moq_native::tls::Connect::default();
 		tls.root = self.root.clone();
 		tls.cert = self.cert.clone();
 		tls.key = self.key.clone();
-		tls.disable_verify = self.disable_verify;
+		tls.insecure = self.disable_verify;
 		Ok(tls)
 	}
 }
@@ -295,7 +295,7 @@ pub struct AuthConfig {
 	/// Not a CLI or TOML field; the deprecated `--auth-tls-*` flags override it.
 	#[arg(skip)]
 	#[serde(skip)]
-	client_tls: Option<moq_native::tls::Client>,
+	client_tls: Option<moq_native::tls::Connect>,
 
 	/// Public (unauthenticated) access configuration.
 	///
@@ -584,7 +584,7 @@ impl AuthConfig {
 	/// `client_tls` is the cluster client TLS (`--client-tls-*`); the auth client
 	/// reuses it for outbound HTTP unless the deprecated `--auth-tls-*` flags are
 	/// set.
-	pub async fn init(mut self, client_tls: &moq_native::tls::Client) -> anyhow::Result<Auth> {
+	pub async fn init(mut self, client_tls: &moq_native::tls::Connect) -> anyhow::Result<Auth> {
 		self.client_tls = Some(client_tls.clone());
 		Auth::new(self).await
 	}
@@ -2728,7 +2728,7 @@ api = "https://api.example.com/access"
 		// New path: the identity is supplied via the shared --client-tls-* config
 		// (injected through AuthConfig::init) instead of the deprecated
 		// --auth-tls-* flags. The server accepts it the same way.
-		let mut client_tls = moq_native::tls::Client::default();
+		let mut client_tls = moq_native::tls::Connect::default();
 		client_tls.root = vec![fx.ca_pem_path.clone()];
 		client_tls.cert = Some(fx.client_cert_path.clone());
 		client_tls.key = Some(fx.client_key_path.clone());

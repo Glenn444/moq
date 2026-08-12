@@ -53,11 +53,11 @@ pub struct Cli {
 #[derive(Args, Clone)]
 #[cfg_attr(
 	feature = "cluster-lan",
-	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind", "cluster-lan"]))
+	command(group = ArgGroup::new("moq").multiple(true).args(["connect", "listen", "cluster-lan"]))
 )]
 #[cfg_attr(
 	not(feature = "cluster-lan"),
-	command(group = ArgGroup::new("moq").multiple(true).args(["client-connect", "server-bind"]))
+	command(group = ArgGroup::new("moq").multiple(true).args(["connect", "listen"]))
 )]
 pub struct MoqSide {
 	/// The broadcast name. Optional for the point endpoints (stdin/stdout, HLS
@@ -80,11 +80,15 @@ pub struct MoqSide {
 
 	/// MoQ client config (`--client-connect`, `--client-bind`, `--client-tls-*`, ...).
 	#[command(flatten)]
-	pub client: moq_native::ClientConfig,
+	pub client: moq_native::connect::Config,
+
+	/// QUIC transport tuning (`--quic-*`), shared by the dial and accept sides.
+	#[command(flatten)]
+	pub quic: moq_native::quic::Config,
 
 	/// MoQ server transport config (`--server-bind`, `--server-tls-*`, `--tls-*`).
 	#[command(flatten)]
-	pub server: moq_native::ServerConfig,
+	pub server: moq_native::listen::Config,
 
 	/// Iroh transport config (`--iroh-*`), used by both the client and server.
 	#[cfg(feature = "iroh")]
@@ -123,8 +127,8 @@ impl MoqSide {
 	/// things the user would otherwise have to spell out: an ephemeral port and a
 	/// generated certificate. An explicit `--server-bind` or `--tls-*` wins, which
 	/// is what puts the mesh on the same port and certificate as everything else.
-	pub fn server_config(&self) -> moq_native::ServerConfig {
-		let mut config = self.server.clone();
+	pub fn server_config(&self) -> moq_native::listen::Config {
+		let mut config = self.server.resolved();
 		if self.lan() {
 			config.bind.get_or_insert_with(|| "[::]:0".to_string());
 			if config.tls.generate.is_empty() && config.tls.cert.is_empty() {
@@ -136,7 +140,7 @@ impl MoqSide {
 
 	/// Whether a listener has to be bound at all.
 	pub fn serves(&self) -> bool {
-		self.server.bind.is_some() || self.lan()
+		self.server.resolved().bind.is_some() || self.lan()
 	}
 
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
@@ -144,14 +148,14 @@ impl MoqSide {
 	/// `devices` is exempt.
 	pub fn validate(&self) -> anyhow::Result<()> {
 		anyhow::ensure!(
-			self.client.connect.is_some() || self.serves(),
-			"a MoQ side is required: pass --client-connect <url> to dial a relay, --server-bind <addr> to self-host, or --cluster-lan to mesh over the LAN"
+			self.client.resolved().url.is_some() || self.serves(),
+			"a MoQ side is required: pass --connect <url> to dial a relay, --listen <addr> to self-host, or --cluster-lan to mesh over the LAN"
 		);
 		#[cfg(feature = "cluster-lan")]
 		{
 			self.cluster.validate()?;
 			if self.lan() {
-				crate::cluster::validate_versions(&self.client, &self.server_config())?;
+				crate::cluster::validate_versions(&self.client.resolved(), &self.server_config())?;
 			}
 		}
 		Ok(())
@@ -170,9 +174,13 @@ impl MoqSide {
 		#[cfg(not(feature = "cluster-lan"))]
 		let cluster_secret = false;
 
+		// Read through the fold: a legacy `--client-connect` must be rejected here
+		// too, and it only lands in `url` once resolved.
+		let connect = self.client.resolved();
+		let listen = self.server.resolved();
 		let ignored = [
-			("--client-connect", self.client.connect.is_some()),
-			("--server-bind", self.server.bind.is_some()),
+			("--connect", connect.url.is_some()),
+			("--listen", listen.bind.is_some()),
 			("--cluster-lan", self.lan()),
 			("--cluster-lan-secret", cluster_secret),
 			("--broadcast", self.broadcast.is_some()),
@@ -415,13 +423,16 @@ mod tests {
 		assert!(cli.moq.reject("token").is_ok());
 
 		// ...these it refuses, rather than accepting the flag and ignoring it.
-		for flag in [
-			["--client-connect", "https://relay.example.com"],
-			["--broadcast", "room"],
+		for (flag, value, reported) in [
+			("--connect", "https://relay.example.com", "--connect"),
+			// The released spelling folds in, so it is rejected under its
+			// canonical name rather than silently ignored.
+			("--client-connect", "https://relay.example.com", "--connect"),
+			("--broadcast", "room", "--broadcast"),
 		] {
-			let cli = Cli::try_parse_from(["moq", flag[0], flag[1], "token", "generate"]).unwrap();
+			let cli = Cli::try_parse_from(["moq", flag, value, "token", "generate"]).unwrap();
 			let err = cli.moq.reject("token").unwrap_err().to_string();
-			assert!(err.contains(flag[0]), "{err}");
+			assert!(err.contains(reported), "{err}");
 		}
 
 		#[cfg(feature = "cluster-lan")]
@@ -529,11 +540,17 @@ mod tests {
 	#[cfg(feature = "cluster-lan")]
 	#[test]
 	fn cluster_lan_requires_a_path_capable_version() {
-		for flag in ["--client-version", "--server-version"] {
+		// Both the canonical spellings and the released ones, which fold in.
+		for (flag, reported) in [
+			("--connect-version", "--connect-version"),
+			("--listen-version", "--listen-version"),
+			("--client-version", "--connect-version"),
+			("--server-version", "--listen-version"),
+		] {
 			let cli =
 				Cli::try_parse_from(["moq", "--cluster-lan", flag, "moq-lite-04", "import", "ts"]).expect("parse");
 			let err = cli.moq.validate().unwrap_err().to_string();
-			assert!(err.contains(flag), "{err}");
+			assert!(err.contains(reported), "{flag}: {err}");
 		}
 
 		let cli = Cli::try_parse_from([

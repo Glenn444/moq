@@ -18,7 +18,7 @@ const WIRE_VERSION: qmux::Version = qmux::Version::QMux01;
 /// Plaintext Unix-socket qmux listener settings, with an optional
 /// peer-credential allowlist.
 ///
-/// Flattened onto [`crate::ServerConfig::unix`].
+/// Flattened onto [`crate::listen::Config::unix`].
 // The derived arg group is named after the struct, so it needs an explicit id to
 // stay unique across the flattened sections.
 #[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

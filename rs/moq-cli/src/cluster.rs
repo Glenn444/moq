@@ -28,8 +28,8 @@ fn carries_request_path(version: &moq_net::Version) -> bool {
 
 /// Reject version restrictions that leave the mesh with no request path.
 pub(crate) fn validate_versions(
-	client: &moq_native::ClientConfig,
-	server: &moq_native::ServerConfig,
+	client: &moq_native::connect::Config,
+	server: &moq_native::listen::Config,
 ) -> anyhow::Result<()> {
 	let client = client.versions();
 	let server = server.versions();
@@ -37,7 +37,7 @@ pub(crate) fn validate_versions(
 		client
 			.iter()
 			.any(|version| carries_request_path(version) && server.contains(version)),
-		"--cluster-lan needs --client-version and --server-version to share a version that carries a request path (moq-lite-05 or any moq-transport version)"
+		"--cluster-lan needs --connect-version and --listen-version to share a version that carries a request path (moq-lite-05 or any moq-transport version)"
 	);
 	Ok(())
 }
@@ -56,7 +56,7 @@ pub struct Lan {
 	credential: String,
 
 	/// The dial template, per-peer fingerprint applied on top.
-	client: moq_native::ClientConfig,
+	client: moq_native::connect::Config,
 }
 
 /// The discovered details needed to open one LAN dial.
@@ -89,7 +89,7 @@ impl Lan {
 		args: &Args,
 		origin: moq_net::origin::Producer,
 		server: &moq_native::Server,
-		mut client: moq_native::ClientConfig,
+		mut client: moq_native::connect::Config,
 	) -> anyhow::Result<(Self, mdns::Discovery)> {
 		let port = server
 			.local_addr()
@@ -109,11 +109,11 @@ impl Lan {
 		// A peer that is still advertising is still wanted, however long it has
 		// been unreachable; mDNS expiry is what ends a dial, not a retry budget.
 		client.backoff.timeout = Some(std::time::Duration::ZERO);
-		// Whatever `--client-reconnect` means for the relay dial, a mesh dial has to
-		// keep redialing: the map is keyed on the advertisement, so a one-shot handle
-		// that stopped after the first session would sit there dead until mDNS
-		// expired the peer and re-reported it.
-		client.reconnect = Some(true);
+		// Whatever `--connect-once` means for the relay dial, a mesh dial has to keep
+		// redialing: the map is keyed on the advertisement, so a one-shot handle that
+		// stopped after the first session would sit there dead until mDNS expired the
+		// peer and re-reported it.
+		client.once = Some(false);
 		// Each peer gets its own client, so they cannot all share one fixed port.
 		// Keep the configured interface and let the OS pick the port, otherwise a
 		// nonzero `--client-bind` means the second peer (or the first, when
@@ -242,12 +242,12 @@ impl Lan {
 		// the advertised fingerprint is the whole trust decision, and combining it
 		// with roots is rejected outright, so start from a clean TLS config.
 		if let Some(fingerprint) = &peer.fingerprint {
-			config.tls = moq_native::tls::Client::default();
+			config.tls = moq_native::tls::Connect::default();
 			config.tls.fingerprint = vec![fingerprint.clone()];
 		}
 
 		let client = config
-			.init()?
+			.init(Default::default())?
 			.with_publisher(&self.origin)
 			.with_subscriber(self.origin.clone());
 		Ok(client.connect(addrs))
@@ -441,7 +441,7 @@ mod tests {
 		Lan {
 			origin: moq_net::Origin::random().produce(),
 			credential: credential.to_string(),
-			client: moq_native::ClientConfig::default(),
+			client: moq_native::connect::Config::default(),
 		}
 	}
 
@@ -496,7 +496,7 @@ mod tests {
 	/// generated certificate anyway.
 	#[tokio::test]
 	async fn pinning_a_peer_drops_the_relay_roots() {
-		let mut client = moq_native::ClientConfig::default();
+		let mut client = moq_native::connect::Config::default();
 		client.tls.root = vec!["ca.pem".into()];
 		let mut lan = lan("ours");
 		lan.client = client;
@@ -555,10 +555,10 @@ mod tests {
 	fn listener() -> (moq_native::Server, DialTarget) {
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-		let mut config = moq_native::ServerConfig::default();
+		let mut config = moq_native::listen::Config::default();
 		config.bind = Some("127.0.0.1:0".to_string());
 		config.tls.generate = vec!["moq-cluster-lan".to_string()];
-		let server = config.init().expect("failed to bind listener");
+		let server = config.init(Default::default()).expect("failed to bind listener");
 
 		let port = server.local_addr().expect("no local addr").port();
 		let fingerprint = server
@@ -671,14 +671,14 @@ mod tests {
 		tokio::spawn(serve(server, accept, origin.clone(), crate::Direction::Import, false));
 
 		// An ordinary client: no mesh marker, no proof, just the advertised port.
-		let mut config = moq_native::ClientConfig::default();
-		config.tls = moq_native::tls::Client::default();
+		let mut config = moq_native::connect::Config::default();
+		config.tls = moq_native::tls::Connect::default();
 		config.tls.fingerprint = vec![peer.fingerprint.clone().expect("fingerprint")];
-		config.reconnect = Some(false);
+		config.once = Some(true);
 		let stolen = moq_net::Origin::random().produce();
 		let url = peer.urls.into_iter().next().expect("an address");
 		let connection = config
-			.init()
+			.init(Default::default())
 			.expect("client")
 			.with_subscriber(stolen.clone())
 			.connect(url);

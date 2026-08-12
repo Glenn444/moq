@@ -71,7 +71,11 @@ pub struct Config {
 
 	/// The MoQ client configuration.
 	#[command(flatten)]
-	pub client: moq_native::ClientConfig,
+	pub client: moq_native::connect::Config,
+
+	/// QUIC transport tuning (`--quic-*`).
+	#[command(flatten)]
+	pub quic: moq_native::quic::Config,
 
 	/// The log configuration.
 	#[command(flatten)]
@@ -201,8 +205,8 @@ async fn run(config: &Config) -> Result<()> {
 	tracing::info!(rom = %rom_path.display(), %name, "starting Game Boy emulator");
 
 	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<input::Command>(64);
-	let url = config.client.connect.clone().context("--client-connect is required")?;
-	let client = config.client.clone().init()?;
+	let url = config.client.url.clone().context("--client-connect is required")?;
+	let client = config.client.clone().init(config.quic.clone())?;
 
 	// Publish origin: the game session broadcast.
 	let publish_origin = moq_net::Origin::random().produce();
@@ -506,8 +510,9 @@ mod tests {
 
 		let connect = config
 			.client
-			.connect
-			.expect("--client-connect should reach the client config");
+			.resolved()
+			.url
+			.expect("the connect URL should reach the dial config");
 		assert_eq!(connect.scheme(), "http");
 		assert_eq!(connect.host_str(), Some("localhost"));
 		assert_eq!(connect.port(), Some(4443));

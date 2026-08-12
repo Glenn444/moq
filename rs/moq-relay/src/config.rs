@@ -15,12 +15,20 @@ pub struct Config {
 	/// The QUIC/TLS configuration for the server.
 	#[command(flatten)]
 	#[serde(default)]
-	pub server: moq_native::ServerConfig,
+	#[serde(alias = "server")]
+	pub listen: moq_native::listen::Config,
 
 	/// The QUIC/TLS configuration for the client. (clustering only)
 	#[command(flatten)]
 	#[serde(default)]
-	pub client: moq_native::ClientConfig,
+	#[serde(alias = "client")]
+	pub connect: moq_native::connect::Config,
+
+	/// QUIC transport tuning (`--quic-*`), shared by the dial and accept sides:
+	/// these knobs mean the same thing whichever way the connection was opened.
+	#[command(flatten)]
+	#[serde(default)]
+	pub quic: moq_native::quic::Config,
 
 	/// Log configuration.
 	#[command(flatten)]
@@ -125,10 +133,91 @@ impl Config {
 	}
 }
 
+impl Config {
+	/// Fold every released spelling in, then apply the relay's own defaults.
+	///
+	/// Order matters: `--server-quic-max-streams` lands on the hidden legacy arg, and
+	/// filling in [`crate::DEFAULT_MAX_STREAMS`] first would give the fold a canonical
+	/// value to prefer, silently discarding what the deployment asked for.
+	pub(crate) fn resolve(&mut self) {
+		self.quic = self.quic.resolved();
+		self.listen = self.listen.resolved();
+		self.connect = self.connect.resolved();
+
+		self.quic.max_streams.get_or_insert(crate::DEFAULT_MAX_STREAMS);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::test_env::EnvGuard;
+
+	/// A released `--server-quic-max-streams` must survive the relay's own default.
+	///
+	/// The fold prefers the canonical field, so defaulting before folding would pin
+	/// every deployment that still uses the old spelling to 10,000 streams.
+	#[test]
+	fn released_max_streams_survives_the_relay_default() {
+		let _env = EnvGuard::clear(&["MOQ_QUIC_MAX_STREAMS", "MOQ_SERVER_QUIC_MAX_STREAMS"]);
+
+		let mut config = Config::parse_from(["moq-relay", "--server-quic-max-streams", "4096"]);
+		config.resolve();
+		assert_eq!(config.quic.max_streams, Some(4096));
+
+		let mut config = Config::parse_from(["moq-relay"]);
+		config.resolve();
+		assert_eq!(config.quic.max_streams, Some(crate::DEFAULT_MAX_STREAMS));
+	}
+
+	/// The released `--server-*` accept-side spellings reach the fields the
+	/// listeners actually read.
+	#[test]
+	fn released_listen_spellings_reach_the_listener() {
+		let _env = EnvGuard::clear(&[
+			"MOQ_LISTEN",
+			"MOQ_SERVER_BIND",
+			"MOQ_LISTEN_TLS_CERT",
+			"MOQ_SERVER_TLS_CERT",
+		]);
+
+		let mut config = Config::parse_from([
+			"moq-relay",
+			"--server-bind",
+			"[::]:4443",
+			"--server-tls-cert",
+			"/tmp/cert.pem",
+			"--server-tls-key",
+			"/tmp/cert.key",
+		]);
+		config.resolve();
+
+		assert_eq!(config.listen.bind.as_deref(), Some("[::]:4443"));
+		assert_eq!(config.listen.tls.cert, vec![std::path::PathBuf::from("/tmp/cert.pem")]);
+		assert_eq!(config.listen.tls.key, vec![std::path::PathBuf::from("/tmp/cert.key")]);
+	}
+
+	/// Every config under `demo/relay/` still parses.
+	///
+	/// These are the configs a reader copies, and a rename that lands in the code
+	/// but not in them is invisible until someone's relay refuses to boot. A move
+	/// across tables (`[server.quic]` to a top-level `[quic]`) is the case serde
+	/// aliases cannot cover, which is exactly why this reads the real files.
+	#[test]
+	fn demo_configs_parse() {
+		let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demo/relay");
+		let mut checked = 0;
+		for entry in std::fs::read_dir(&dir).expect("demo/relay") {
+			let path = entry.expect("dir entry").path();
+			if path.extension().is_none_or(|ext| ext != "toml") {
+				continue;
+			}
+			let toml = std::fs::read_to_string(&path).expect("read config");
+			toml::from_str::<Config>(&toml).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+			checked += 1;
+		}
+		assert!(checked > 0, "no demo configs found in {}", dir.display());
+	}
 
 	/// Regression test for the clap+TOML interaction documented on
 	/// `Config::parse_and_merge`. A TOML file that enables stats with no
@@ -253,7 +342,7 @@ linger = "30s"
 	}
 
 	/// Regression test for the same clap+TOML clobber bug applied to the
-	/// `preferred_v4` / `preferred_v6` fields on `moq-native::ServerConfig`.
+	/// `preferred_v4` / `preferred_v6` fields on `moq_native::listen::Config`.
 	/// If either field is ever re-typed as a bare `SocketAddrV4` / `SocketAddrV6`
 	/// (without `Option<>`), the CLI re-parse will overwrite the TOML value
 	/// with `Default::default()` and silently disable the
@@ -261,10 +350,12 @@ linger = "30s"
 	/// TOML. This test asserts the TOML value survives an absent CLI flag.
 	#[test]
 	fn cli_does_not_clobber_toml_preferred_addresses() {
-		let _env = EnvGuard::clear(&["MOQ_SERVER_PREFERRED_V4", "MOQ_SERVER_PREFERRED_V6"]);
+		let _env = EnvGuard::clear(&["MOQ_LISTEN_PREFERRED_V4", "MOQ_LISTEN_PREFERRED_V6"]);
 
+		// They are accept-only, so they live on `[listen]` rather than in the
+		// shared `[listen.quic]` tuning.
 		let toml = r#"
-[server.quic]
+[listen]
 preferred_v4 = "192.0.2.1:443"
 preferred_v6 = "[2001:db8::1]:443"
 "#;
@@ -277,14 +368,14 @@ preferred_v6 = "[2001:db8::1]:443"
 		let config = Config::parse_and_merge(args).expect("config load");
 
 		assert_eq!(
-			config.server.quic.preferred_v4,
+			config.listen.preferred_v4,
 			Some("192.0.2.1:443".parse().unwrap()),
-			"TOML's server.quic.preferred_v4 must not be clobbered by the CLI re-parse"
+			"TOML's listen.preferred_v4 must not be clobbered by the CLI re-parse"
 		);
 		assert_eq!(
-			config.server.quic.preferred_v6,
+			config.listen.preferred_v6,
 			Some("[2001:db8::1]:443".parse().unwrap()),
-			"TOML's server.quic.preferred_v6 must not be clobbered by the CLI re-parse"
+			"TOML's listen.preferred_v6 must not be clobbered by the CLI re-parse"
 		);
 	}
 
@@ -295,7 +386,7 @@ preferred_v6 = "[2001:db8::1]:443"
 		let _env = EnvGuard::clear(&["MOQ_SERVER_QUIC_QLOG"]);
 
 		let toml = r#"
-[server.quic]
+[quic]
 qlog = "/tmp/moq-qlog"
 "#;
 		let dir = std::env::temp_dir().join("moq-relay-config-test");
@@ -307,9 +398,9 @@ qlog = "/tmp/moq-qlog"
 		let config = Config::parse_and_merge(args).expect("config load");
 
 		assert_eq!(
-			config.server.quic.qlog.as_deref(),
+			config.quic.qlog.as_deref(),
 			Some(std::path::Path::new("/tmp/moq-qlog")),
-			"TOML's server.quic.qlog must not be clobbered by the CLI re-parse"
+			"TOML's quic.qlog must not be clobbered by the CLI re-parse"
 		);
 	}
 
@@ -326,11 +417,8 @@ qlog = "/tmp/moq-qlog"
 		]);
 
 		let toml = r#"
-[server.quic]
+[quic]
 congestion_control = "delay"
-
-[client.quic]
-congestion_control = "loss"
 "#;
 		let dir = std::env::temp_dir().join("moq-relay-config-test");
 		std::fs::create_dir_all(&dir).unwrap();
@@ -340,15 +428,12 @@ congestion_control = "loss"
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
 		let config = Config::parse_and_merge(args).expect("config load");
 
+		// One value, shared by the dial and accept sides: the knob means the same
+		// thing whichever way the connection was opened.
 		assert_eq!(
-			config.server.quic.congestion_control,
+			config.quic.congestion_control,
 			Some(moq_native::quic::CongestionControl::Delay),
-			"TOML's server.quic.congestion_control must not be clobbered by the CLI re-parse"
-		);
-		assert_eq!(
-			config.client.quic.congestion_control,
-			Some(moq_native::quic::CongestionControl::Loss),
-			"TOML's client.quic.congestion_control must not be clobbered by the CLI re-parse"
+			"TOML's quic.congestion_control must not be clobbered by the CLI re-parse"
 		);
 	}
 
@@ -370,7 +455,7 @@ timeout = "2m"
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
 		let config = Config::parse_and_merge(args).expect("config load");
 
-		assert_eq!(config.client.timeout, Some(std::time::Duration::from_secs(120)));
+		assert_eq!(config.connect.timeout, Some(std::time::Duration::from_secs(120)));
 	}
 
 	#[test]
@@ -477,7 +562,7 @@ system_roots = true
 		let config = Config::parse_and_merge(args).expect("config load");
 
 		assert_eq!(
-			config.client.tls.system_roots,
+			config.connect.tls.system_roots,
 			Some(true),
 			"TOML's client.tls.system_roots must not be clobbered by the CLI re-parse"
 		);
@@ -571,14 +656,14 @@ uid = [1001]
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
 		let config = Config::parse_and_merge(args).expect("config load");
 
-		assert_eq!(config.server.bind.as_deref(), Some("[::]:443"));
+		assert_eq!(config.listen.bind.as_deref(), Some("[::]:443"));
 		assert_eq!(
-			config.server.unix.bind.as_deref(),
+			config.listen.unix.bind.as_deref(),
 			Some(std::path::Path::new("/run/moq/internal.sock")),
 			"TOML's server.unix.bind must not be clobbered by the CLI re-parse"
 		);
 		assert_eq!(
-			config.server.unix.allow.expect("allow present").uid,
+			config.listen.unix.allow.expect("allow present").uid,
 			vec![1001],
 			"TOML's server.unix.allow must not be clobbered by the CLI re-parse"
 		);

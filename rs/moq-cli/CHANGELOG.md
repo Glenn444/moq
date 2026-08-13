@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.10...moq-cli-v0.9.11) - 2026-08-13
+
+### Other
+
+- updated the following local packages: moq-video, moq-transcode
+
 ## [0.9.10](https://github.com/moq-dev/moq/compare/moq-cli-v0.9.9...moq-cli-v0.9.10) - 2026-08-13
 
 ### Fixed
